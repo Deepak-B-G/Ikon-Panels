@@ -1,0 +1,23 @@
+# FastAPI framework
+fastapi==0.111.0
+
+# ASGI server to run FastAPI
+uvicorn[standard]==0.30.1
+
+# SQLAlchemy ORM for DB access
+SQLAlchemy==2.0.30
+
+# MySQL connector for SQLAlchemy
+mysql-connector-python==8.3.0
+
+# For password hashing (if needed, Argon2id or bcrypt or sha256 wrapper)
+passlib[bcrypt]==1.7.4
+
+# For loading environment variables
+python-dotenv==1.0.1
+
+# For MQTT client (publish/subscribe)
+paho-mqtt==1.6.1
+
+# Optional: useful for async DB handling
+aiomysql==0.2.0
