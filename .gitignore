@@ -1,1 +1,4 @@
-.env
+.venv
+.vscode
+app/__pycache__/
+app/routes/__pycache__/
