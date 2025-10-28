@@ -1,0 +1,51 @@
+service: api
+
+frameworkVersion: "^3.0.0"
+configValidationMode: error
+useDotenv: true
+
+custom:
+  prune:
+    automatic: true
+    number: 2
+  addHttpOffline:
+    dev: []
+    local:
+      - httpApi:
+          method: '*'
+          path: '/{proxy+}'
+  esbuild:
+    config: './esbuild.config.js'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: eu-north-1
+  stage: ${opt:stage, 'dev'}
+  deploymentMethod: direct
+  logRetentionInDays: 7
+
+package:
+  individually: true
+  patterns:
+    - '!.git'
+    - '!.github'
+    - '!src/**'
+    - '!.gitignore'
+    - '!esbuild.config.js'
+    - '!nest-cli.json'
+    - '!package-lock.json'
+    - '!tsconfig*'
+
+functions:
+  api:
+    handler: dist/main.handler
+    memorySize: 256
+    timeout: 20
+    url: true
+    events: ${self:custom.addHttpOffline.${param:stage, self:provider.stage}}
+
+plugins:
+  - serverless-esbuild
+  - serverless-offline
+  - serverless-prune-plugin
