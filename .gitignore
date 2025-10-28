@@ -1,5 +1,76 @@
-.venv
-.vscode
-app/__pycache__/
-app/routes/__pycache__/
-serverless.yml
+# =====================================
+# 🔧 Build & Dependency Artifacts
+# =====================================
+/dist
+/build
+/lambda-deploy
+/node_modules
+deploy-package.zip
+
+# Serverless / Webpack build artifacts
+.serverless/
+.webpack/
+*.tsbuildinfo
+
+# =====================================
+# 🧾 Logs & Reports
+# =====================================
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Diagnostic reports (Node.js)
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# =====================================
+# ⚙️ Environment & Config
+# =====================================
+.env
+.env.local
+.env.*.local
+*.env
+
+# =====================================
+# 🧪 Test Coverage
+# =====================================
+/coverage
+/.nyc_output
+/jest-cache
+/jest-test-results.json
+
+# =====================================
+# 💻 IDEs and Editors
+# =====================================
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# =====================================
+# 🗑️ Temporary & Cache Files
+# =====================================
+.temp/
+.tmp/
+.cache/
+*.pid
+*.pid.lock
+*.seed
+pids
+
+# =====================================
+# 💽 OS-specific
+# =====================================
+.DS_Store
+Thumbs.db
