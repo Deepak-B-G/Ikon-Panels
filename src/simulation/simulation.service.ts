@@ -1,96 +1,127 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
-import { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
+import {
+  DynamoDBClient,
+  GetItemCommand,
+  PutItemCommand,
+} from '@aws-sdk/client-dynamodb';
+
+type Mode = 'running' | 'stopped';
 
 @Injectable()
 export class SimulationService {
   private readonly ddb = new DynamoDBClient({});
   private readonly TABLE = process.env.TABLE_NAME || 'ikon-sim-state';
-  private readonly MAX_RPM = 3000;
-  private readonly RAMP_RPM_PER_SEC = 300;
-  private readonly FILL_PER_SEC = 0.25;
-  private readonly DRAIN_PER_SEC = 0.1;
 
-  private clamp(v: number, lo: number, hi: number) {
-    return Math.max(lo, Math.min(hi, v));
+  // ------------------ utils ------------------
+
+  private jitter(base: number, spread: number) {
+    const v = base + (Math.random() * 2 - 1) * spread;
+    return Math.round(v * 10) / 10;
   }
 
+  // ------------------ LOAD / SAVE ------------------
+
   private async load(deviceId: string) {
-    const res = await this.ddb.send(new GetItemCommand({
-      TableName: this.TABLE,
-      Key: { deviceId: { S: deviceId } },
-    }));
+    const res = await this.ddb.send(
+      new GetItemCommand({
+        TableName: this.TABLE,
+        Key: { deviceId: { S: deviceId } },
+      }),
+    );
 
     if (res.Item) {
       return {
         deviceId,
-        mode: res.Item.mode.S,
-        rpm: Number(res.Item.rpm.N),
-        rpmTarget: Number(res.Item.rpmTarget.N),
-        waterLevel: Number(res.Item.waterLevel.N),
-        waterTarget: Number(res.Item.waterTarget.N),
-        lastChange: res.Item.lastChange.S,
-        lastSampleAt: res.Item.lastSampleAt?.S || res.Item.lastChange.S,
+        mode: (res.Item.mode?.S ?? 'stopped') as 'running' | 'stopped',
+        autoStart: res.Item.autoStart?.BOOL ?? false,
+        power: (res.Item.power?.S ?? 'OFF') as 'ON' | 'OFF',
+        amps: res.Item.amps?.S
+          ? JSON.parse(res.Item.amps.S)
+          : { r: 0, y: 0, b: 0 },
+        volts: res.Item.volts?.S
+          ? JSON.parse(res.Item.volts.S)
+          : { r: 230, y: 230, b: 230 },
+        ts: res.Item.ts?.S ?? new Date().toISOString(),
       };
     }
 
-    // Default initialization
-    const now = new Date().toISOString();
+    // ---------- default initialization ----------
     const init = {
-      deviceId, mode: 'stopped',
-      rpm: 0, rpmTarget: this.MAX_RPM,
-      waterLevel: 35.0, waterTarget: 100,
-      lastChange: now, lastSampleAt: now,
+      deviceId,
+      mode: 'stopped' as const,
+      autoStart: false,
+      power: 'OFF' as const,
+      amps: { r: 0, y: 0, b: 0 },
+      volts: { r: 230, y: 230, b: 230 },
+      ts: new Date().toISOString(),
     };
+
     await this.save(init);
     return init;
   }
 
+
   private async save(state: any) {
-    await this.ddb.send(new PutItemCommand({
-      TableName: this.TABLE,
-      Item: {
-        deviceId: { S: state.deviceId },
-        mode: { S: state.mode },
-        rpm: { N: String(state.rpm) },
-        rpmTarget: { N: String(state.rpmTarget) },
-        waterLevel: { N: String(state.waterLevel) },
-        waterTarget: { N: String(state.waterTarget) },
-        lastChange: { S: state.lastChange },
-        lastSampleAt: { S: state.lastSampleAt },
-      },
-    }));
+    await this.ddb.send(
+      new PutItemCommand({
+        TableName: this.TABLE,
+        Item: {
+          deviceId: { S: state.deviceId },
+          mode: { S: state.mode },
+          autoStart: { BOOL: state.autoStart },
+          power: { S: state.power },
+          amps: { S: JSON.stringify(state.amps) },
+          volts: { S: JSON.stringify(state.volts) },
+          ts: { S: state.ts },
+        },
+      }),
+    );
   }
 
-  private evolve(prev: any, now: Date) {
-    const last = new Date(prev.lastSampleAt || prev.lastChange);
-    const elapsed = Math.max(0, (now.getTime() - last.getTime()) / 1000);
-    const target = prev.mode === 'running' ? (prev.rpmTarget || this.MAX_RPM) : 0;
+  // ------------------ SIMULATION TICK (same as Wix) ------------------
 
-    let rpm = prev.rpm;
-    if (rpm < target) rpm = Math.min(target, rpm + this.RAMP_RPM_PER_SEC * elapsed);
-    else if (rpm > target) rpm = Math.max(target, rpm - this.RAMP_RPM_PER_SEC * elapsed);
+  private tick(prev: any) {
+    const running = prev.mode === 'running';
 
-    let water = prev.waterLevel;
-    if (prev.mode === 'running')
-      water = this.clamp(water + this.FILL_PER_SEC * elapsed, 0, 100);
-    else
-      water = this.clamp(water - this.DRAIN_PER_SEC * elapsed, 0, 100);
+    const power = running ? 'ON' : 'OFF';
+
+    let amps;
+    let volts;
+
+    if (running) {
+      amps = {
+        r: this.jitter(10, 0.5),
+        y: this.jitter(10, 0.5),
+        b: this.jitter(10, 0.5),
+      };
+
+      volts = {
+        r: this.jitter(230, 2),
+        y: this.jitter(231, 2),
+        b: this.jitter(229, 2),
+      };
+    } else {
+      amps = { r: 0, y: 0, b: 0 };
+      volts = { r: 230, y: 230, b: 230 };
+    }
 
     return {
       ...prev,
-      rpm: Math.round(rpm),
-      waterLevel: Math.round(water * 10) / 10,
-      lastSampleAt: now.toISOString(),
+      power,
+      amps,
+      volts,
+      ts: new Date().toISOString(),
     };
   }
+
+  // ------------------ PUBLIC API ------------------
 
   async handleTelemetry(deviceId: string) {
     try {
       let state = await this.load(deviceId);
-      const now = new Date();
-      state = this.evolve(state, now);
+      state = this.tick(state);
       await this.save(state);
-      return { deviceId, ts: now.toISOString(), rpm: state.rpm, waterLevel: state.waterLevel, mode: state.mode };
+      return state;
     } catch (err) {
       console.error(err);
       throw new InternalServerErrorException('Error fetching telemetry');
@@ -100,14 +131,19 @@ export class SimulationService {
   async handleCommand(deviceId: string, action: string) {
     try {
       let state = await this.load(deviceId);
-      const now = new Date();
-      state = this.evolve(state, now);
 
-      if (action === 'start') { state.mode = 'running'; state.lastChange = now.toISOString(); }
-      else if (action === 'stop') { state.mode = 'stopped'; state.lastChange = now.toISOString(); }
+      if (action === 'start') state.mode = 'running';
+      if (action === 'stop') state.mode = 'stopped';
+      if (action === 'auto_on') state.autoStart = true;
+      if (action === 'auto_off') state.autoStart = false;
 
+      state = this.tick(state);
       await this.save(state);
-      return { ok: true, state };
+
+      return {
+        ok: true,
+        state,
+      };
     } catch (err) {
       console.error(err);
       throw new InternalServerErrorException('Error processing command');
