@@ -16,7 +16,14 @@ interface SimState {
   powerOn: boolean;
   autoStart: boolean;
 
-  // Dry Run
+  // Delays
+  pendingPowerOn: boolean;
+  powerOnAt: string | null;
+
+  pendingAutoStart: boolean;
+  autoStartAt: string | null;
+
+  // Dry run
   dryRunTripped: boolean;
   dryRunTrippedAt: string | null;
   restartPending: boolean;
@@ -41,10 +48,9 @@ export class SimulationService {
 
   private readonly AMP_BASE = 10;
   private readonly AMP_SPREAD = 2;
-
   private readonly VOLTS = { r: 230, y: 231, b: 229 };
 
-  // ================= UTILS =================
+  // ================= UTIL =================
   private jitter(base: number, spread: number) {
     return Math.round((base + (Math.random() * 2 - 1) * spread) * 10) / 10;
   }
@@ -78,6 +84,12 @@ export class SimulationService {
         powerOn: res.Item.powerOn?.BOOL ?? false,
         autoStart: res.Item.autoStart?.BOOL ?? false,
 
+        pendingPowerOn: res.Item.pendingPowerOn?.BOOL ?? false,
+        powerOnAt: res.Item.powerOnAt?.S ?? null,
+
+        pendingAutoStart: res.Item.pendingAutoStart?.BOOL ?? false,
+        autoStartAt: res.Item.autoStartAt?.S ?? null,
+
         dryRunTripped: res.Item.dryRunTripped?.BOOL ?? false,
         dryRunTrippedAt: res.Item.dryRunTrippedAt?.S ?? null,
         restartPending: res.Item.restartPending?.BOOL ?? false,
@@ -98,6 +110,12 @@ export class SimulationService {
       mode: 'stopped',
       powerOn: false,
       autoStart: false,
+
+      pendingPowerOn: false,
+      powerOnAt: null,
+
+      pendingAutoStart: false,
+      autoStartAt: null,
 
       dryRunTripped: false,
       dryRunTrippedAt: null,
@@ -127,26 +145,23 @@ export class SimulationService {
           powerOn: { BOOL: state.powerOn },
           autoStart: { BOOL: state.autoStart },
 
+          pendingPowerOn: { BOOL: state.pendingPowerOn },
+          powerOnAt: state.powerOnAt ? { S: state.powerOnAt } : { NULL: true },
+
+          pendingAutoStart: { BOOL: state.pendingAutoStart },
+          autoStartAt: state.autoStartAt ? { S: state.autoStartAt } : { NULL: true },
+
           dryRunTripped: { BOOL: state.dryRunTripped },
-          dryRunTrippedAt: state.dryRunTrippedAt
-            ? { S: state.dryRunTrippedAt }
-            : { NULL: true },
+          dryRunTrippedAt: state.dryRunTrippedAt ? { S: state.dryRunTrippedAt } : { NULL: true },
 
           restartPending: { BOOL: state.restartPending },
           restartAt: state.restartAt ? { S: state.restartAt } : { NULL: true },
 
           overloadTripped: { BOOL: state.overloadTripped },
-          overloadTrippedAt: state.overloadTrippedAt
-            ? { S: state.overloadTrippedAt }
-            : { NULL: true },
+          overloadTrippedAt: state.overloadTrippedAt ? { S: state.overloadTrippedAt } : { NULL: true },
 
-          cyclePhase: state.cyclePhase
-            ? { S: state.cyclePhase }
-            : { NULL: true },
-
-          cycleUntil: state.cycleUntil
-            ? { S: state.cycleUntil }
-            : { NULL: true },
+          cyclePhase: state.cyclePhase ? { S: state.cyclePhase } : { NULL: true },
+          cycleUntil: state.cycleUntil ? { S: state.cycleUntil } : { NULL: true },
 
           settings: { S: JSON.stringify(state.settings ?? {}) },
         },
@@ -158,19 +173,15 @@ export class SimulationService {
   async saveSettings(deviceId: string, settings: any) {
     const state = await this.load(deviceId);
 
-    if ('cyclicRunHrs' in settings || 'cyclicRunMins' in settings) {
-      settings.cyclicRunMin =
-        Number(settings.cyclicRunHrs || 0) * 60 +
-        Number(settings.cyclicRunMins || 0);
-    }
+    settings.cyclicRunMin =
+      Number(settings.cyclicRunHrs || 0) * 60 +
+      Number(settings.cyclicRunMins || 0);
 
-    if ('cyclicOffHrs' in settings || 'cyclicOffMins' in settings) {
-      settings.cyclicOffMin =
-        Number(settings.cyclicOffHrs || 0) * 60 +
-        Number(settings.cyclicOffMins || 0);
-    }
+    settings.cyclicOffMin =
+      Number(settings.cyclicOffHrs || 0) * 60 +
+      Number(settings.cyclicOffMins || 0);
 
-    state.settings = settings ?? {};
+    state.settings = settings;
     await this.save(state);
     return { ok: true };
   }
@@ -181,64 +192,18 @@ export class SimulationService {
       const state = await this.load(deviceId);
       const now = Date.now();
 
-      const amps =
-        state.mode === 'running' && state.powerOn
-          ? {
-              r: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
-              y: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
-              b: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
-            }
-          : { r: 0, y: 0, b: 0 };
-
-      // OVERLOAD
-      if (
-        state.mode === 'running' &&
-        state.settings?.overloadEnabled
-      ) {
-        const limit = Number(state.settings?.overloadAmps || 0);
-        if (limit > 0 && Math.max(amps.r, amps.y, amps.b) > limit) {
-          state.overloadTripped = true;
-          state.overloadTrippedAt = new Date(now).toISOString();
-          state.mode = 'stopped';
-          state.powerOn = false;
-          state.restartPending = false;
-        }
-      }
-
-      // DRY RUN
-      if (
-        state.mode === 'running' &&
-        state.settings?.dryRunEnabled &&
-        !state.dryRunTripped
-      ) {
-        if (!state.dryRunTrippedAt) {
-          state.dryRunTrippedAt = new Date(now + 5000).toISOString();
-        } else if (now >= new Date(state.dryRunTrippedAt).getTime()) {
-          state.dryRunTripped = true;
-          state.mode = 'stopped';
-          state.powerOn = false;
-
-          if (state.settings?.dryRunRestartEnabled) {
-            const mins = Number(state.settings?.dryRunRestartDelayMin || 1);
-            state.restartPending = true;
-            state.restartAt = new Date(
-              now + mins * 60 * 1000,
-            ).toISOString();
-          }
-        }
-      }
-
-      // DRY RUN RESTART
-      if (
-        state.restartPending &&
-        state.restartAt &&
-        now >= new Date(state.restartAt).getTime()
-      ) {
-        state.restartPending = false;
-        state.restartAt = null;
-        state.dryRunTripped = false;
-        state.dryRunTrippedAt = null;
+      // AUTO START DELAY
+      if (state.pendingAutoStart && state.autoStartAt && now >= Date.parse(state.autoStartAt)) {
+        state.pendingAutoStart = false;
+        state.autoStartAt = null;
+        state.powerOn = true;
         state.mode = 'running';
+      }
+
+      // POWER ON DELAY
+      if (state.pendingPowerOn && state.powerOnAt && now >= Date.parse(state.powerOnAt)) {
+        state.pendingPowerOn = false;
+        state.powerOnAt = null;
         state.powerOn = true;
       }
 
@@ -250,38 +215,51 @@ export class SimulationService {
         if (!state.cyclePhase) {
           state.cyclePhase = 'RUN';
           state.mode = 'running';
+          state.pendingPowerOn = false;
           state.powerOn = true;
-          state.cycleUntil = new Date(
-            now + runMin * 60 * 1000,
-          ).toISOString();
+          state.cycleUntil = new Date(now + runMin * 60000).toISOString();
         }
 
-        if (state.cycleUntil && now >= new Date(state.cycleUntil).getTime()) {
+        if (state.cycleUntil && now >= Date.parse(state.cycleUntil)) {
           if (state.cyclePhase === 'RUN') {
             state.cyclePhase = 'OFF';
             state.mode = 'stopped';
             state.powerOn = false;
-            state.cycleUntil = new Date(
-              now + offMin * 60 * 1000,
-            ).toISOString();
+            state.cycleUntil = new Date(now + offMin * 60000).toISOString();
           } else {
             state.cyclePhase = 'RUN';
             state.mode = 'running';
             state.powerOn = true;
-            state.cycleUntil = new Date(
-              now + runMin * 60 * 1000,
-            ).toISOString();
+            state.cycleUntil = new Date(now + runMin * 60000).toISOString();
           }
         }
-      } else {
-        state.cyclePhase = null;
-        state.cycleUntil = null;
+      }
+
+      // AMPS
+      const amps =
+        state.mode === 'running' && state.powerOn
+          ? {
+              r: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
+              y: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
+              b: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
+            }
+          : { r: 0, y: 0, b: 0 };
+
+      // OVERLOAD
+      if (state.mode === 'running' && state.settings?.overloadEnabled) {
+        const limit = Number(state.settings.overloadAmps || 0);
+        if (limit > 0 && Math.max(amps.r, amps.y, amps.b) > limit) {
+          state.overloadTripped = true;
+          state.overloadTrippedAt = new Date().toISOString();
+          state.mode = 'stopped';
+          state.powerOn = false;
+        }
       }
 
       await this.save(state);
 
       return {
-        deviceId: state.deviceId,
+        deviceId,
         ts: new Date().toISOString(),
         mode: state.mode,
         autoStart: state.autoStart,
@@ -293,41 +271,56 @@ export class SimulationService {
           b: this.jitter(this.VOLTS.b, 2),
         },
       };
-    } catch (err) {
-      console.error(err);
+    } catch (e) {
+      console.error(e);
       throw new InternalServerErrorException('Telemetry error');
     }
   }
 
   // ================= COMMAND =================
   async handleCommand(deviceId: string, action: string) {
-    try {
-      const state = await this.load(deviceId);
+    const state = await this.load(deviceId);
+    const now = Date.now();
 
-      if (action === 'start') {
-        state.mode = 'running';
+    if (action === 'start') {
+      state.mode = 'running';
+
+      if (state.settings?.powerOnDelayEnabled) {
+        state.pendingPowerOn = true;
+        state.powerOnAt = new Date(
+          now + Number(state.settings.powerOnDelaySec || 0) * 1000,
+        ).toISOString();
+      } else {
         state.powerOn = true;
-        state.overloadTripped = false;
-        state.dryRunTripped = false;
-        state.restartPending = false;
       }
-
-      if (action === 'stop') {
-        state.mode = 'stopped';
-        state.powerOn = false;
-        state.cyclePhase = null;
-        state.cycleUntil = null;
-        state.restartPending = false;
-      }
-
-      if (action === 'auto_on') state.autoStart = true;
-      if (action === 'auto_off') state.autoStart = false;
-
-      await this.save(state);
-      return { ok: true };
-    } catch (err) {
-      console.error(err);
-      throw new InternalServerErrorException('Command error');
     }
+
+    if (action === 'stop') {
+      state.mode = 'stopped';
+      state.powerOn = false;
+      state.pendingPowerOn = false;
+      state.pendingAutoStart = false;
+      state.cyclePhase = null;
+      state.cycleUntil = null;
+    }
+
+    if (action === 'auto_on') {
+      state.autoStart = true;
+      if (state.settings?.autoStartDelayEnabled) {
+        state.pendingAutoStart = true;
+        state.autoStartAt = new Date(
+          now + Number(state.settings.autoStartDelaySec || 0) * 1000,
+        ).toISOString();
+      }
+    }
+
+    if (action === 'auto_off') {
+      state.autoStart = false;
+      state.pendingAutoStart = false;
+      state.autoStartAt = null;
+    }
+
+    await this.save(state);
+    return { ok: true };
   }
 }
