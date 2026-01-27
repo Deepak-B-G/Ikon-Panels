@@ -43,7 +43,11 @@ interface SimState {
 
 @Injectable()
 export class SimulationService {
-  private readonly ddb = new DynamoDBClient({});
+  private readonly ddb = new DynamoDBClient({
+    // Safe: avoids "Region is missing" if env isn’t injected properly
+    region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
+  });
+
   private readonly TABLE = process.env.TABLE_NAME || 'ikon-sim-state';
 
   private readonly AMP_BASE = 10;
@@ -173,6 +177,7 @@ export class SimulationService {
   async saveSettings(deviceId: string, settings: any) {
     const state = await this.load(deviceId);
 
+    // Keep your settings as-is, just derive mins for cyclic logic
     settings.cyclicRunMin =
       Number(settings.cyclicRunHrs || 0) * 60 +
       Number(settings.cyclicRunMins || 0);
@@ -193,7 +198,11 @@ export class SimulationService {
       const now = Date.now();
 
       // AUTO START DELAY
-      if (state.pendingAutoStart && state.autoStartAt && now >= Date.parse(state.autoStartAt)) {
+      if (
+        state.pendingAutoStart &&
+        state.autoStartAt &&
+        now >= Date.parse(state.autoStartAt)
+      ) {
         state.pendingAutoStart = false;
         state.autoStartAt = null;
         state.powerOn = true;
@@ -201,7 +210,11 @@ export class SimulationService {
       }
 
       // POWER ON DELAY
-      if (state.pendingPowerOn && state.powerOnAt && now >= Date.parse(state.powerOnAt)) {
+      if (
+        state.pendingPowerOn &&
+        state.powerOnAt &&
+        now >= Date.parse(state.powerOnAt)
+      ) {
         state.pendingPowerOn = false;
         state.powerOnAt = null;
         state.powerOn = true;
@@ -215,8 +228,12 @@ export class SimulationService {
         if (!state.cyclePhase) {
           state.cyclePhase = 'RUN';
           state.mode = 'running';
+
+          // Note: cyclic currently bypasses powerOnDelay (same as your original behavior)
           state.pendingPowerOn = false;
+          state.powerOnAt = null;
           state.powerOn = true;
+
           state.cycleUntil = new Date(now + runMin * 60000).toISOString();
         }
 
@@ -251,8 +268,18 @@ export class SimulationService {
         if (limit > 0 && Math.max(amps.r, amps.y, amps.b) > limit) {
           state.overloadTripped = true;
           state.overloadTrippedAt = new Date().toISOString();
+
+          // Trip stops motor
           state.mode = 'stopped';
           state.powerOn = false;
+
+          // Important cleanup (prevents delayed flip back to ON later)
+          state.pendingPowerOn = false;
+          state.powerOnAt = null;
+          state.pendingAutoStart = false;
+          state.autoStartAt = null;
+          state.cyclePhase = null;
+          state.cycleUntil = null;
         }
       }
 
@@ -286,11 +313,17 @@ export class SimulationService {
       state.mode = 'running';
 
       if (state.settings?.powerOnDelayEnabled) {
+        // Key fix: prevent stale ON from previous runs
+        state.powerOn = false;
+
         state.pendingPowerOn = true;
         state.powerOnAt = new Date(
           now + Number(state.settings.powerOnDelaySec || 0) * 1000,
         ).toISOString();
       } else {
+        // Key fix: clear any old pending delay values
+        state.pendingPowerOn = false;
+        state.powerOnAt = null;
         state.powerOn = true;
       }
     }
@@ -298,19 +331,32 @@ export class SimulationService {
     if (action === 'stop') {
       state.mode = 'stopped';
       state.powerOn = false;
+
+      // Key fix: clear timestamps too
       state.pendingPowerOn = false;
+      state.powerOnAt = null;
+
       state.pendingAutoStart = false;
+      state.autoStartAt = null;
+
       state.cyclePhase = null;
       state.cycleUntil = null;
     }
 
     if (action === 'auto_on') {
       state.autoStart = true;
+
       if (state.settings?.autoStartDelayEnabled) {
         state.pendingAutoStart = true;
         state.autoStartAt = new Date(
           now + Number(state.settings.autoStartDelaySec || 0) * 1000,
         ).toISOString();
+      } else {
+        // Optional consistency: if auto start has no delay, start immediately
+        state.pendingAutoStart = false;
+        state.autoStartAt = null;
+        state.mode = 'running';
+        state.powerOn = true;
       }
     }
 
