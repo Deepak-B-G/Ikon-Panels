@@ -74,3 +74,10 @@ pids
 # =====================================
 .DS_Store
 Thumbs.db
+
+
+ws-test.js
+
+ikon-iot-key.pem
+
+.dockerignore

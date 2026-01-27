@@ -1,19 +1,38 @@
-import { Controller, Get, Post, Body, Query } from '@nestjs/common';
+import { Controller, Get, Post, Query, Body } from '@nestjs/common';
 import { SimulationService } from './simulation.service';
 
-@Controller('simulation')
+@Controller()
 export class SimulationController {
-  constructor(private readonly simulationService: SimulationService) {}
+  constructor(private readonly sim: SimulationService) {}
 
   @Get('telemetry')
-  async getTelemetry(@Query('deviceId') deviceId = 'pump-001') {
-    return this.simulationService.handleTelemetry(deviceId);
+  async getTelemetry(
+    @Query('deviceId') deviceId: string,
+  ) {
+    return this.sim.handleTelemetry(deviceId);
   }
 
+
   @Post('command')
-  async postCommand(@Body() body: { deviceId?: string; action?: string }) {
-    const deviceId = body.deviceId || 'pump-001';
-    const action = (body.action || '').toLowerCase();
-    return this.simulationService.handleCommand(deviceId, action);
+  async sendCommand(
+    @Body()
+    body: {
+      deviceId: string;
+      action: string;
+    },
+  ) {
+    return this.sim.handleCommand(body.deviceId, body.action);
+  }
+
+
+  @Post('settings')
+  async saveSettings(
+    @Body()
+    body: {
+      deviceId: string;
+      settings: Record<string, any>;
+    },
+  ) {
+    return this.sim.saveSettings(body.deviceId, body.settings);
   }
 }

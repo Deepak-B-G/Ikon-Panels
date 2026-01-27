@@ -1,116 +1,372 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
-import { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
+import {
+  DynamoDBClient,
+  GetItemCommand,
+  PutItemCommand,
+} from '@aws-sdk/client-dynamodb';
+
+type Mode = 'running' | 'stopped';
+type CyclePhase = 'RUN' | 'OFF' | null;
+
+interface SimState {
+  deviceId: string;
+
+  // Motor
+  mode: Mode;
+  powerOn: boolean;
+  autoStart: boolean;
+
+  // Delays
+  pendingPowerOn: boolean;
+  powerOnAt: string | null;
+
+  pendingAutoStart: boolean;
+  autoStartAt: string | null;
+
+  // Dry run
+  dryRunTripped: boolean;
+  dryRunTrippedAt: string | null;
+  restartPending: boolean;
+  restartAt: string | null;
+
+  // Overload
+  overloadTripped: boolean;
+  overloadTrippedAt: string | null;
+
+  // Cyclic
+  cyclePhase: CyclePhase;
+  cycleUntil: string | null;
+
+  // Settings
+  settings: Record<string, any>;
+}
 
 @Injectable()
 export class SimulationService {
-  private readonly ddb = new DynamoDBClient({});
-  private readonly TABLE = process.env.TABLE_NAME || 'ikon-sim-state';
-  private readonly MAX_RPM = 3000;
-  private readonly RAMP_RPM_PER_SEC = 300;
-  private readonly FILL_PER_SEC = 0.25;
-  private readonly DRAIN_PER_SEC = 0.1;
+  private readonly ddb = new DynamoDBClient({
+    // Safe: avoids "Region is missing" if env isn’t injected properly
+    region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
+  });
 
-  private clamp(v: number, lo: number, hi: number) {
-    return Math.max(lo, Math.min(hi, v));
+  private readonly TABLE = process.env.TABLE_NAME || 'ikon-sim-state';
+
+  private readonly AMP_BASE = 10;
+  private readonly AMP_SPREAD = 2;
+  private readonly VOLTS = { r: 230, y: 231, b: 229 };
+
+  // ================= UTIL =================
+  private jitter(base: number, spread: number) {
+    return Math.round((base + (Math.random() * 2 - 1) * spread) * 10) / 10;
   }
 
-  private async load(deviceId: string) {
-    const res = await this.ddb.send(new GetItemCommand({
-      TableName: this.TABLE,
-      Key: { deviceId: { S: deviceId } },
-    }));
+  private parseJson(attr?: { S?: string }): Record<string, any> {
+    if (!attr?.S) return {};
+    try {
+      return JSON.parse(attr.S);
+    } catch {
+      return {};
+    }
+  }
+
+  private parseCyclePhase(v?: string): CyclePhase {
+    return v === 'RUN' || v === 'OFF' ? v : null;
+  }
+
+  // ================= LOAD / SAVE =================
+  private async load(deviceId: string): Promise<SimState> {
+    const res = await this.ddb.send(
+      new GetItemCommand({
+        TableName: this.TABLE,
+        Key: { deviceId: { S: deviceId } },
+      }),
+    );
 
     if (res.Item) {
       return {
         deviceId,
-        mode: res.Item.mode.S,
-        rpm: Number(res.Item.rpm.N),
-        rpmTarget: Number(res.Item.rpmTarget.N),
-        waterLevel: Number(res.Item.waterLevel.N),
-        waterTarget: Number(res.Item.waterTarget.N),
-        lastChange: res.Item.lastChange.S,
-        lastSampleAt: res.Item.lastSampleAt?.S || res.Item.lastChange.S,
+        mode: res.Item.mode?.S === 'running' ? 'running' : 'stopped',
+        powerOn: res.Item.powerOn?.BOOL ?? false,
+        autoStart: res.Item.autoStart?.BOOL ?? false,
+
+        pendingPowerOn: res.Item.pendingPowerOn?.BOOL ?? false,
+        powerOnAt: res.Item.powerOnAt?.S ?? null,
+
+        pendingAutoStart: res.Item.pendingAutoStart?.BOOL ?? false,
+        autoStartAt: res.Item.autoStartAt?.S ?? null,
+
+        dryRunTripped: res.Item.dryRunTripped?.BOOL ?? false,
+        dryRunTrippedAt: res.Item.dryRunTrippedAt?.S ?? null,
+        restartPending: res.Item.restartPending?.BOOL ?? false,
+        restartAt: res.Item.restartAt?.S ?? null,
+
+        overloadTripped: res.Item.overloadTripped?.BOOL ?? false,
+        overloadTrippedAt: res.Item.overloadTrippedAt?.S ?? null,
+
+        cyclePhase: this.parseCyclePhase(res.Item.cyclePhase?.S),
+        cycleUntil: res.Item.cycleUntil?.S ?? null,
+
+        settings: this.parseJson(res.Item.settings),
       };
     }
 
-    // Default initialization
-    const now = new Date().toISOString();
-    const init = {
-      deviceId, mode: 'stopped',
-      rpm: 0, rpmTarget: this.MAX_RPM,
-      waterLevel: 35.0, waterTarget: 100,
-      lastChange: now, lastSampleAt: now,
+    const init: SimState = {
+      deviceId,
+      mode: 'stopped',
+      powerOn: false,
+      autoStart: false,
+
+      pendingPowerOn: false,
+      powerOnAt: null,
+
+      pendingAutoStart: false,
+      autoStartAt: null,
+
+      dryRunTripped: false,
+      dryRunTrippedAt: null,
+      restartPending: false,
+      restartAt: null,
+
+      overloadTripped: false,
+      overloadTrippedAt: null,
+
+      cyclePhase: null,
+      cycleUntil: null,
+
+      settings: {},
     };
+
     await this.save(init);
     return init;
   }
 
-  private async save(state: any) {
-    await this.ddb.send(new PutItemCommand({
-      TableName: this.TABLE,
-      Item: {
-        deviceId: { S: state.deviceId },
-        mode: { S: state.mode },
-        rpm: { N: String(state.rpm) },
-        rpmTarget: { N: String(state.rpmTarget) },
-        waterLevel: { N: String(state.waterLevel) },
-        waterTarget: { N: String(state.waterTarget) },
-        lastChange: { S: state.lastChange },
-        lastSampleAt: { S: state.lastSampleAt },
-      },
-    }));
+  private async save(state: SimState) {
+    await this.ddb.send(
+      new PutItemCommand({
+        TableName: this.TABLE,
+        Item: {
+          deviceId: { S: state.deviceId },
+          mode: { S: state.mode },
+          powerOn: { BOOL: state.powerOn },
+          autoStart: { BOOL: state.autoStart },
+
+          pendingPowerOn: { BOOL: state.pendingPowerOn },
+          powerOnAt: state.powerOnAt ? { S: state.powerOnAt } : { NULL: true },
+
+          pendingAutoStart: { BOOL: state.pendingAutoStart },
+          autoStartAt: state.autoStartAt ? { S: state.autoStartAt } : { NULL: true },
+
+          dryRunTripped: { BOOL: state.dryRunTripped },
+          dryRunTrippedAt: state.dryRunTrippedAt ? { S: state.dryRunTrippedAt } : { NULL: true },
+
+          restartPending: { BOOL: state.restartPending },
+          restartAt: state.restartAt ? { S: state.restartAt } : { NULL: true },
+
+          overloadTripped: { BOOL: state.overloadTripped },
+          overloadTrippedAt: state.overloadTrippedAt ? { S: state.overloadTrippedAt } : { NULL: true },
+
+          cyclePhase: state.cyclePhase ? { S: state.cyclePhase } : { NULL: true },
+          cycleUntil: state.cycleUntil ? { S: state.cycleUntil } : { NULL: true },
+
+          settings: { S: JSON.stringify(state.settings ?? {}) },
+        },
+      }),
+    );
   }
 
-  private evolve(prev: any, now: Date) {
-    const last = new Date(prev.lastSampleAt || prev.lastChange);
-    const elapsed = Math.max(0, (now.getTime() - last.getTime()) / 1000);
-    const target = prev.mode === 'running' ? (prev.rpmTarget || this.MAX_RPM) : 0;
+  // ================= SETTINGS =================
+  async saveSettings(deviceId: string, settings: any) {
+    const state = await this.load(deviceId);
 
-    let rpm = prev.rpm;
-    if (rpm < target) rpm = Math.min(target, rpm + this.RAMP_RPM_PER_SEC * elapsed);
-    else if (rpm > target) rpm = Math.max(target, rpm - this.RAMP_RPM_PER_SEC * elapsed);
+    // Keep your settings as-is, just derive mins for cyclic logic
+    settings.cyclicRunMin =
+      Number(settings.cyclicRunHrs || 0) * 60 +
+      Number(settings.cyclicRunMins || 0);
 
-    let water = prev.waterLevel;
-    if (prev.mode === 'running')
-      water = this.clamp(water + this.FILL_PER_SEC * elapsed, 0, 100);
-    else
-      water = this.clamp(water - this.DRAIN_PER_SEC * elapsed, 0, 100);
+    settings.cyclicOffMin =
+      Number(settings.cyclicOffHrs || 0) * 60 +
+      Number(settings.cyclicOffMins || 0);
 
-    return {
-      ...prev,
-      rpm: Math.round(rpm),
-      waterLevel: Math.round(water * 10) / 10,
-      lastSampleAt: now.toISOString(),
-    };
+    state.settings = settings;
+    await this.save(state);
+    return { ok: true };
   }
 
+  // ================= TELEMETRY =================
   async handleTelemetry(deviceId: string) {
     try {
-      let state = await this.load(deviceId);
-      const now = new Date();
-      state = this.evolve(state, now);
+      const state = await this.load(deviceId);
+      const now = Date.now();
+
+      // AUTO START DELAY
+      if (
+        state.pendingAutoStart &&
+        state.autoStartAt &&
+        now >= Date.parse(state.autoStartAt)
+      ) {
+        state.pendingAutoStart = false;
+        state.autoStartAt = null;
+        state.powerOn = true;
+        state.mode = 'running';
+      }
+
+      // POWER ON DELAY
+      if (
+        state.pendingPowerOn &&
+        state.powerOnAt &&
+        now >= Date.parse(state.powerOnAt)
+      ) {
+        state.pendingPowerOn = false;
+        state.powerOnAt = null;
+        state.powerOn = true;
+      }
+
+      // CYCLIC
+      if (state.settings?.cyclicEnabled) {
+        const runMin = Number(state.settings.cyclicRunMin || 0);
+        const offMin = Number(state.settings.cyclicOffMin || 0);
+
+        if (!state.cyclePhase) {
+          state.cyclePhase = 'RUN';
+          state.mode = 'running';
+
+          // Note: cyclic currently bypasses powerOnDelay (same as your original behavior)
+          state.pendingPowerOn = false;
+          state.powerOnAt = null;
+          state.powerOn = true;
+
+          state.cycleUntil = new Date(now + runMin * 60000).toISOString();
+        }
+
+        if (state.cycleUntil && now >= Date.parse(state.cycleUntil)) {
+          if (state.cyclePhase === 'RUN') {
+            state.cyclePhase = 'OFF';
+            state.mode = 'stopped';
+            state.powerOn = false;
+            state.cycleUntil = new Date(now + offMin * 60000).toISOString();
+          } else {
+            state.cyclePhase = 'RUN';
+            state.mode = 'running';
+            state.powerOn = true;
+            state.cycleUntil = new Date(now + runMin * 60000).toISOString();
+          }
+        }
+      }
+
+      // AMPS
+      const amps =
+        state.mode === 'running' && state.powerOn
+          ? {
+              r: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
+              y: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
+              b: this.jitter(this.AMP_BASE, this.AMP_SPREAD),
+            }
+          : { r: 0, y: 0, b: 0 };
+
+      // OVERLOAD
+      if (state.mode === 'running' && state.settings?.overloadEnabled) {
+        const limit = Number(state.settings.overloadAmps || 0);
+        if (limit > 0 && Math.max(amps.r, amps.y, amps.b) > limit) {
+          state.overloadTripped = true;
+          state.overloadTrippedAt = new Date().toISOString();
+
+          // Trip stops motor
+          state.mode = 'stopped';
+          state.powerOn = false;
+
+          // Important cleanup (prevents delayed flip back to ON later)
+          state.pendingPowerOn = false;
+          state.powerOnAt = null;
+          state.pendingAutoStart = false;
+          state.autoStartAt = null;
+          state.cyclePhase = null;
+          state.cycleUntil = null;
+        }
+      }
+
       await this.save(state);
-      return { deviceId, ts: now.toISOString(), rpm: state.rpm, waterLevel: state.waterLevel, mode: state.mode };
-    } catch (err) {
-      console.error(err);
-      throw new InternalServerErrorException('Error fetching telemetry');
+
+      return {
+        deviceId,
+        ts: new Date().toISOString(),
+        mode: state.mode,
+        autoStart: state.autoStart,
+        power: state.powerOn ? 'ON' : 'OFF',
+        amps,
+        volts: {
+          r: this.jitter(this.VOLTS.r, 2),
+          y: this.jitter(this.VOLTS.y, 2),
+          b: this.jitter(this.VOLTS.b, 2),
+        },
+      };
+    } catch (e) {
+      console.error(e);
+      throw new InternalServerErrorException('Telemetry error');
     }
   }
 
+  // ================= COMMAND =================
   async handleCommand(deviceId: string, action: string) {
-    try {
-      let state = await this.load(deviceId);
-      const now = new Date();
-      state = this.evolve(state, now);
+    const state = await this.load(deviceId);
+    const now = Date.now();
 
-      if (action === 'start') { state.mode = 'running'; state.lastChange = now.toISOString(); }
-      else if (action === 'stop') { state.mode = 'stopped'; state.lastChange = now.toISOString(); }
+    if (action === 'start') {
+      state.mode = 'running';
 
-      await this.save(state);
-      return { ok: true, state };
-    } catch (err) {
-      console.error(err);
-      throw new InternalServerErrorException('Error processing command');
+      if (state.settings?.powerOnDelayEnabled) {
+        // Key fix: prevent stale ON from previous runs
+        state.powerOn = false;
+
+        state.pendingPowerOn = true;
+        state.powerOnAt = new Date(
+          now + Number(state.settings.powerOnDelaySec || 0) * 1000,
+        ).toISOString();
+      } else {
+        // Key fix: clear any old pending delay values
+        state.pendingPowerOn = false;
+        state.powerOnAt = null;
+        state.powerOn = true;
+      }
     }
+
+    if (action === 'stop') {
+      state.mode = 'stopped';
+      state.powerOn = false;
+
+      // Key fix: clear timestamps too
+      state.pendingPowerOn = false;
+      state.powerOnAt = null;
+
+      state.pendingAutoStart = false;
+      state.autoStartAt = null;
+
+      state.cyclePhase = null;
+      state.cycleUntil = null;
+    }
+
+    if (action === 'auto_on') {
+      state.autoStart = true;
+
+      if (state.settings?.autoStartDelayEnabled) {
+        state.pendingAutoStart = true;
+        state.autoStartAt = new Date(
+          now + Number(state.settings.autoStartDelaySec || 0) * 1000,
+        ).toISOString();
+      } else {
+        // Optional consistency: if auto start has no delay, start immediately
+        state.pendingAutoStart = false;
+        state.autoStartAt = null;
+        state.mode = 'running';
+        state.powerOn = true;
+      }
+    }
+
+    if (action === 'auto_off') {
+      state.autoStart = false;
+      state.pendingAutoStart = false;
+      state.autoStartAt = null;
+    }
+
+    await this.save(state);
+    return { ok: true };
   }
 }

@@ -17,6 +17,6 @@
     "noImplicitAny": false,
     "sourceMap": true
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "src/simulation/ws-test.js"],
   "exclude": ["node_modules", "dist"]
 }
