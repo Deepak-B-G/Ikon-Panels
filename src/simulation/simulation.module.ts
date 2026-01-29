@@ -3,7 +3,7 @@ import { SimulationService } from './simulation.service';
 import { SimulationController } from './simulation.controller';
 
 @Module({
-  controllers: [SimulationController],
   providers: [SimulationService],
+  controllers: [SimulationController],
 })
 export class SimulationModule {}
