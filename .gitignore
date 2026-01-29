@@ -1,11 +1,8 @@
 # =====================================
 # 🔧 Build & Dependency Artifacts
 # =====================================
-/dist
-/build
-/lambda-deploy
 /node_modules
-deploy-package.zip
+
 
 # Serverless / Webpack build artifacts
 .serverless/
@@ -75,8 +72,6 @@ pids
 .DS_Store
 Thumbs.db
 
-
-ws-test.js
 
 ikon-iot-key.pem
 
