@@ -1,7 +1,8 @@
 # =====================================
 # 🔧 Build & Dependency Artifacts
 # =====================================
-/node_modules
+node_modules
+dist
 
 
 # Serverless / Webpack build artifacts
@@ -71,8 +72,5 @@ pids
 # =====================================
 .DS_Store
 Thumbs.db
-
-
-ikon-iot-key.pem
 
 .dockerignore
