@@ -22,17 +22,42 @@ export class UiService {
   private readonly STATE_TABLE =
     process.env.DEVICE_STATE_TABLE || 'ikon-device-state';
 
-  private qKey(deviceId: string) {
-    return `q:${deviceId}`;
+  // ============================
+  // ✅ Latest-command-wins keys
+  // ============================
+  private cmdKey(deviceId: string) {
+    return `cmd:${deviceId}`; // single-slot pending command
   }
 
-  // ---------- UI -> enqueue command for device ----------
-  async enqueueCommand(body: any) {
-    const deviceId = body?.deviceId;
-    const action = body?.action;
-    const payload = body?.payload || {};
+  private validate(body: any) {
+    // Accept multiple shapes. Primary expected shape is:
+    // { deviceId, action, payload }
+    // But callers may pass a wrapped API response like:
+    // { status, message, data: { ok:true, cmd: { deviceId, action, payload } } }
+    // or { cmd: { ... } }.
+    let src = body;
 
-    if (!deviceId || !action) throw new BadRequestException('deviceId and action required');
+    if (!src?.deviceId) {
+      if (src?.data?.cmd) src = src.data.cmd;
+      else if (src?.cmd) src = src.cmd;
+    }
+
+    const deviceId = src?.deviceId;
+    const action = src?.action;
+    const payload = src?.payload || {};
+
+    if (!deviceId || !action) {
+      throw new BadRequestException('deviceId and action required');
+    }
+
+    return { deviceId, action, payload };
+  }
+
+  // ---------------------------------------------------------
+  // UI -> store latest command (overwrite older pending command)
+  // ---------------------------------------------------------
+  async enqueueCommand(body: any) {
+    const { deviceId, action, payload } = this.validate(body);
 
     const cmd = {
       cmdId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -41,9 +66,56 @@ export class UiService {
       ts: isoNow(),
     };
 
-    await this.redis.rpush(this.qKey(deviceId), JSON.stringify(cmd));
+    // ✅ overwrite whatever was pending before (latest wins)
+    await this.redis.set(this.cmdKey(deviceId), JSON.stringify(cmd));
+
+    // Also notify any long-pollers waiting on the list queue so BLPOP wakes.
+    // We push a short notification payload (includes cmdId for debugging).
+    try {
+      await this.redis.rpush(`q:${deviceId}`, `notify:${cmd.cmdId}`);
+    } catch (e) {
+      // Non-fatal: if push fails, command is still available via cmdKey for polling that checks it first
+      console.error('enqueueCommand: failed to notify list queue', e);
+    }
 
     return { ok: true, cmd };
+  }
+
+  // -----------------------------------------
+  // OPTIONAL: debug helper (UI/admin tooling)
+  // -----------------------------------------
+  async peekLatestCommand(deviceId: string) {
+    if (!deviceId) throw new BadRequestException('deviceId required');
+    const raw = await this.redis.get(this.cmdKey(deviceId));
+    return raw ? safeJsonParse(raw) : null;
+  }
+
+  // ------------------------------------------------
+  // ✅ Device poll should use this (consume command)
+  // Atomically: GET + DEL
+  // ------------------------------------------------
+  async consumeLatestCommand(deviceId: string) {
+    if (!deviceId) throw new BadRequestException('deviceId required');
+
+    // Use MULTI for atomicity: read then delete
+    const key = this.cmdKey(deviceId);
+    const multi = this.redis.multi();
+    multi.get(key);
+    multi.del(key);
+
+    const res = await multi.exec();
+    const raw = res?.[0]?.[1] as string | null;
+
+    return raw ? safeJsonParse(raw) : null;
+  }
+
+  // -----------------------------
+  // OPTIONAL: clear pending command
+  // -----------------------------
+  async clearLatestCommand(deviceId: string) {
+    if (!deviceId) throw new BadRequestException('deviceId required');
+    await this.redis.del(this.cmdKey(deviceId));
+    return { ok: true };
   }
 
   // ---------- ✅ UI -> read latest telemetry from DynamoDB ----------
