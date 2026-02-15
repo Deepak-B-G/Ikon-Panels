@@ -1,15 +1,32 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import Redis from 'ioredis';
-import { DynamoDBClient, GetItemCommand } from '@aws-sdk/client-dynamodb';
+import {
+  DynamoDBClient,
+  GetItemCommand,
+  UpdateItemCommand,
+} from '@aws-sdk/client-dynamodb';
 
 function isoNow() {
   return new Date().toISOString();
 }
 
-function safeJsonParse(s?: string) {
-  if (!s) return {};
-  try { return JSON.parse(s); } catch { return {}; }
+function safeJsonParse<T = any>(s?: string): T {
+  if (!s) return {} as T;
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return {} as T;
+  }
 }
+
+type RunAction = 'start' | 'stop';
+
+type PendingCommand = {
+  cmdId: string;
+  action: string;
+  payload: any;
+  ts: string;
+};
 
 @Injectable()
 export class UiService {
@@ -23,102 +40,188 @@ export class UiService {
     process.env.DEVICE_STATE_TABLE || 'ikon-device-state';
 
   // ============================
-  // ✅ Latest-command-wins keys
+  // Redis keys (separate slots)
   // ============================
-  private cmdKey(deviceId: string) {
-    return `cmd:${deviceId}`; // single-slot pending command
+  private runCmdKey(deviceId: string) {
+    return `cmd:run:${deviceId}`; // start/stop slot
   }
 
-  private validate(body: any) {
-    // Accept multiple shapes. Primary expected shape is:
-    // { deviceId, action, payload }
-    // But callers may pass a wrapped API response like:
-    // { status, message, data: { ok:true, cmd: { deviceId, action, payload } } }
-    // or { cmd: { ... } }.
+  private settingsCmdKey(deviceId: string) {
+    return `cmd:settings:${deviceId}`; // settings slot
+  }
+
+  private notifyQueueKey(deviceId: string) {
+    return `q:${deviceId}`; // used to wake long-poll BLPOP
+  }
+
+  // ============================
+  // Validation helpers
+  // ============================
+  private extract(body: any) {
+    // Accept direct or wrapped response shapes
+    // Primary expected: { deviceId, ... }
+    // Some wrappers: { data: { ... } } or { data: { cmd: {...} } } or { cmd: {...} }
     let src = body;
 
-    if (!src?.deviceId) {
-      if (src?.data?.cmd) src = src.data.cmd;
-      else if (src?.cmd) src = src.cmd;
-    }
+    if (src?.data && typeof src.data === 'object') src = src.data;
+    if (src?.cmd && typeof src.cmd === 'object') src = src.cmd;
+
+    return src || {};
+  }
+
+  private validateRunCommand(body: any) {
+    const src = this.extract(body);
 
     const deviceId = src?.deviceId;
-    const action = src?.action;
-    const payload = src?.payload || {};
+    const action = String(src?.action || '').trim().toLowerCase() as RunAction;
 
-    if (!deviceId || !action) {
-      throw new BadRequestException('deviceId and action required');
+    if (!deviceId) throw new BadRequestException('deviceId required');
+    if (action !== 'start' && action !== 'stop') {
+      throw new BadRequestException('action must be start or stop');
     }
+
+    // optional payload, but start/stop typically empty
+    const payload = src?.payload && typeof src.payload === 'object' ? src.payload : {};
 
     return { deviceId, action, payload };
   }
 
-  // ---------------------------------------------------------
-  // UI -> store latest command (overwrite older pending command)
-  // ---------------------------------------------------------
-  async enqueueCommand(body: any) {
-    const { deviceId, action, payload } = this.validate(body);
+  private validateSettings(body: any) {
+    const src = this.extract(body);
 
-    const cmd = {
+    const deviceId = src?.deviceId;
+    const settings = src?.settings;
+
+    if (!deviceId) throw new BadRequestException('deviceId required');
+    if (!settings || typeof settings !== 'object') {
+      throw new BadRequestException('settings (object) required');
+    }
+
+    return { deviceId, settings };
+  }
+
+  // ============================
+  // UI: start/stop command
+  // POST /api/v1/ui/command
+  // ============================
+  async enqueueRunCommand(body: any) {
+    const { deviceId, action, payload } = this.validateRunCommand(body);
+
+    const cmd: PendingCommand = {
       cmdId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       action,
       payload,
       ts: isoNow(),
     };
 
-    // ✅ overwrite whatever was pending before (latest wins)
-    await this.redis.set(this.cmdKey(deviceId), JSON.stringify(cmd));
+    // ✅ only touches run slot
+    await this.redis.set(this.runCmdKey(deviceId), JSON.stringify(cmd));
 
-    // Also notify any long-pollers waiting on the list queue so BLPOP wakes.
-    // We push a short notification payload (includes cmdId for debugging).
+    // ✅ wake any long-pollers
     try {
-      await this.redis.rpush(`q:${deviceId}`, `notify:${cmd.cmdId}`);
+      await this.redis.rpush(this.notifyQueueKey(deviceId), `notify:${cmd.cmdId}`);
     } catch (e) {
-      // Non-fatal: if push fails, command is still available via cmdKey for polling that checks it first
-      console.error('enqueueCommand: failed to notify list queue', e);
+      console.error('enqueueRunCommand: failed to notify list queue', e);
     }
 
-    return { ok: true, cmd };
+    // Keep response lean (no redundant nested objects)
+    return { ok: true, cmdId: cmd.cmdId, action: cmd.action, ts: cmd.ts };
   }
 
-  // -----------------------------------------
-  // OPTIONAL: debug helper (UI/admin tooling)
-  // -----------------------------------------
-  async peekLatestCommand(deviceId: string) {
+  // ============================
+  // UI: save settings
+  // POST /api/v1/ui/settings
+  // ============================
+  async saveSettings(body: any) {
+    const { deviceId, settings } = this.validateSettings(body);
+
+    const version = Date.now();
+    const updatedAt = isoNow();
+
+    // ✅ store settings in DynamoDB (does NOT overwrite telemetry fields)
+    await this.ddb.send(
+      new UpdateItemCommand({
+        TableName: this.STATE_TABLE,
+        Key: { deviceId: { S: deviceId } },
+        UpdateExpression:
+          'SET #settings = :s, settingsVersion = :v, settingsUpdatedAt = :t',
+        ExpressionAttributeNames: {
+          '#settings': 'settings',
+        },
+        ExpressionAttributeValues: {
+          ':s': { S: JSON.stringify(settings) },
+          ':v': { N: String(version) },
+          ':t': { S: updatedAt },
+        },
+      }),
+    );
+
+    // ✅ enqueue a settings_apply command for device
+    const cmd: PendingCommand = {
+      cmdId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      action: 'settings_apply',
+      payload: {
+        settingsVersion: version,
+        settings, // device needs actual settings (it can't read DynamoDB)
+      },
+      ts: updatedAt,
+    };
+
+    // ✅ only touches settings slot
+    await this.redis.set(this.settingsCmdKey(deviceId), JSON.stringify(cmd));
+
+    // ✅ wake any long-pollers
+    try {
+      await this.redis.rpush(this.notifyQueueKey(deviceId), `notify:${cmd.cmdId}`);
+    } catch (e) {
+      console.error('saveSettings: failed to notify list queue', e);
+    }
+
+    // ✅ UI response (NOT redundant)
+    return {
+      ok: true,
+      deviceId,
+      settingsVersion: version,
+      settingsUpdatedAt: updatedAt,
+      cmdId: cmd.cmdId,
+    };
+  }
+
+  // ============================
+  // UI: get latest settings once
+  // GET /api/v1/ui/settings?deviceId=...
+  // ============================
+  async getLatestSettings(deviceId: string) {
     if (!deviceId) throw new BadRequestException('deviceId required');
-    const raw = await this.redis.get(this.cmdKey(deviceId));
-    return raw ? safeJsonParse(raw) : null;
+
+    const res = await this.ddb.send(
+      new GetItemCommand({
+        TableName: this.STATE_TABLE,
+        Key: { deviceId: { S: deviceId } },
+      }),
+    );
+
+    const item = res.Item;
+    if (!item) {
+      return {
+        deviceId,
+        settings: {},
+        settingsVersion: 0,
+        settingsUpdatedAt: null,
+      };
+    }
+
+    const settings = safeJsonParse(item.settings?.S);
+    const settingsVersion = Number(item.settingsVersion?.N || 0);
+    const settingsUpdatedAt = item.settingsUpdatedAt?.S || null;
+
+    return { deviceId, settings, settingsVersion, settingsUpdatedAt };
   }
 
-  // ------------------------------------------------
-  // ✅ Device poll should use this (consume command)
-  // Atomically: GET + DEL
-  // ------------------------------------------------
-  async consumeLatestCommand(deviceId: string) {
-    if (!deviceId) throw new BadRequestException('deviceId required');
-
-    // Use MULTI for atomicity: read then delete
-    const key = this.cmdKey(deviceId);
-    const multi = this.redis.multi();
-    multi.get(key);
-    multi.del(key);
-
-    const res = await multi.exec();
-    const raw = res?.[0]?.[1] as string | null;
-
-    return raw ? safeJsonParse(raw) : null;
-  }
-
-  // -----------------------------
-  // OPTIONAL: clear pending command
-  // -----------------------------
-  async clearLatestCommand(deviceId: string) {
-    if (!deviceId) throw new BadRequestException('deviceId required');
-    await this.redis.del(this.cmdKey(deviceId));
-    return { ok: true };
-  }
-
-  // ---------- ✅ UI -> read latest telemetry from DynamoDB ----------
+  // ============================
+  // UI: telemetry (polling)
+  // GET /api/v1/ui/telemetry?deviceId=...
+  // ============================
   async getLatestTelemetry(deviceId: string) {
     if (!deviceId) throw new BadRequestException('deviceId required');
 
@@ -131,7 +234,6 @@ export class UiService {
 
     const item = res.Item;
 
-    // If device never sent telemetry yet, return clean defaults
     if (!item) {
       return {
         deviceId,
@@ -165,6 +267,45 @@ export class UiService {
         y: Number(amps.y ?? 0),
         b: Number(amps.b ?? 0),
       },
+    };
+  }
+
+  // ==========================================================
+  // ✅ Device helper: consume BOTH pending commands atomically
+  // DeviceService.poll() should call this.
+  // ==========================================================
+  async consumePending(deviceId: string): Promise<PendingCommand[]> {
+    if (!deviceId) throw new BadRequestException('deviceId required');
+
+    const runKey = this.runCmdKey(deviceId);
+    const setKey = this.settingsCmdKey(deviceId);
+
+    const multi = this.redis.multi();
+    multi.get(runKey);
+    multi.get(setKey);
+    multi.del(runKey);
+    multi.del(setKey);
+
+    const res = await multi.exec();
+
+    const runRaw = (res?.[0]?.[1] as string) || null;
+    const setRaw = (res?.[1]?.[1] as string) || null;
+
+    const cmds: PendingCommand[] = []; // ✅ fixes "never[]" TS inference
+    if (runRaw) cmds.push(safeJsonParse<PendingCommand>(runRaw));
+    if (setRaw) cmds.push(safeJsonParse<PendingCommand>(setRaw));
+
+    return cmds;
+  }
+
+  // Optional debug peek
+  async peekPending(deviceId: string) {
+    if (!deviceId) throw new BadRequestException('deviceId required');
+    const run = await this.redis.get(this.runCmdKey(deviceId));
+    const settings = await this.redis.get(this.settingsCmdKey(deviceId));
+    return {
+      run: run ? safeJsonParse(run) : null,
+      settings: settings ? safeJsonParse(settings) : null,
     };
   }
 }
